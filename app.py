@@ -115,10 +115,14 @@ if UNLAZY_SKILL_FILE.is_file():
         pass
 
 
-IS_RENDER = bool(
-    os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID")
-    or os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+IS_RAILWAY = bool(
+    os.environ.get("RAILWAY_SERVICE_ID") or os.environ.get("RAILWAY_PROJECT_ID")
+    or os.environ.get("RAILWAY_ENVIRONMENT_ID")
 )
+if IS_RAILWAY and os.environ.get("ALPHA_RUNTIME_BACKEND", "").strip().lower() != "railway":
+    raise RuntimeError(
+        "على Railway يجب ضبط ALPHA_RUNTIME_BACKEND=railway حتى لا يعمل التنفيذ داخل خدمة الويب."
+    )
 DATABASE_URL = (os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL") or "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
 
@@ -212,10 +216,10 @@ def connect_db():
         raw = psycopg.connect(dsn, connect_timeout=10, prepare_threshold=None)
         return PostgresConnection(raw)
 
-    if IS_RENDER:
+    if IS_RAILWAY:
         raise RuntimeError(
-            "DATABASE_URL غير مضبوط. اربط خدمة Render بقاعدة Supabase PostgreSQL؛ "
-            "لن يتم استخدام SQLite المؤقتة على Render."
+            "DATABASE_URL غير مضبوط. اربط خدمة Railway بقاعدة PostgreSQL؛ "
+            "لن يتم استخدام SQLite المؤقتة في بيئة الإنتاج."
         )
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -238,13 +242,13 @@ def load_or_create_secret(path: Path, generator):
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip()
 if not app.secret_key:
-    if IS_RENDER:
-        raise RuntimeError("عيّن FLASK_SECRET_KEY في متغيرات Render قبل التشغيل.")
+    if IS_RAILWAY:
+        raise RuntimeError("عيّن FLASK_SECRET_KEY في متغيرات Railway قبل التشغيل.")
     app.secret_key = load_or_create_secret(
         FLASK_SECRET_FILE, lambda: secrets.token_hex(32).encode("ascii")
     ).decode("ascii")
 
-cookie_secure_default = "1" if IS_RENDER or os.environ.get("APP_ENV") == "production" else "0"
+cookie_secure_default = "1" if IS_RAILWAY or os.environ.get("APP_ENV") == "production" else "0"
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
@@ -267,13 +271,13 @@ def load_fernet_key():
         except Exception:
             if len(configured) < 32:
                 raise RuntimeError("API_ENCRYPTION_KEY يجب أن يحتوي 32 حرفاً عشوائياً على الأقل.")
-            # Preserve the existing Render derivation so previously stored secrets remain readable.
+            # Preserve the existing legacy key derivation so previously stored encrypted secrets remain readable.
             derived = base64.urlsafe_b64encode(hashlib.sha256(raw).digest())
             Fernet(derived)
             return derived
-    if USE_POSTGRES or IS_RENDER:
+    if USE_POSTGRES or IS_RAILWAY:
         raise RuntimeError(
-            "عيّن API_ENCRYPTION_KEY في Render. وللحفاظ على مفاتيح API القديمة، "
+            "عيّن API_ENCRYPTION_KEY في Railway. وللحفاظ على مفاتيح API القديمة، "
             "استخدم القيمة الأصلية لملف .api_encryption.key."
         )
     key = load_or_create_secret(ENCRYPTION_KEY_FILE, Fernet.generate_key)
@@ -806,7 +810,7 @@ def init_db():
             )
             print(f"Admin account created: {admin_username}")
         elif admin["role"] != "admin" or not check_password_hash(admin["password_hash"], admin_password):
-            # The explicitly configured Render admin identity is authoritative.
+            # The explicitly configured production admin identity is authoritative.
             conn.execute(
                 "UPDATE users SET role='admin', password_hash=? WHERE id=?",
                 (generate_password_hash(admin_password), admin["id"]),
@@ -2897,10 +2901,10 @@ async function piResetRuntimeWorkspace(message=''){
 }
 async function piRuntimeStartWorkspace(){
   if(!piSelectedFiles.length){piRuntimeSetStatus('أرفق ZIP المشروع أو ملفاته أولاً.','error');return;}
-  if(piRuntimeProvider==='render-sandboxes'&&!window.confirm((piRuntimeTransferNotice||'سيتم إرسال ملفات المشروع إلى Render Sandboxes في Oregon.')+'\n\nهل توافق على نقل ملفات المشروع إلى بيئة التنفيذ البعيدة؟'))return;
+  if(piRuntimeProvider==='railway-runner'&&!window.confirm((piRuntimeTransferNotice||'سيتم إرسال ملفات المشروع إلى خدمة Alpha Runner عبر شبكة Railway الخاصة.')+'\n\nهل توافق على نقل ملفات المشروع إلى بيئة التنفيذ البعيدة؟'))return;
   piRuntimeBusy=true;piRuntimeUpdateControls();piRuntimeSetStatus('Creating isolated workspace…');
   const form=new FormData();piSelectedFiles.forEach(file=>form.append('files',file,file.webkitRelativePath||file.name));
-  if(piRuntimeProvider==='render-sandboxes')form.append('confirm_remote_transfer','1');
+  if(piRuntimeProvider==='railway-runner')form.append('confirm_remote_transfer','1');
   try{
     const response=await fetch('/api/project-runtime/start',{method:'POST',body:form,headers:{'Accept':'application/json'}});const data=await response.json();
     if(!response.ok)throw new Error(data.error||'تعذر بدء بيئة التنفيذ.');
@@ -6654,7 +6658,7 @@ def diagnostic_error_message(exc, route):
         return "تعذر حل اسم خادم المزود عبر DNS.", status
     if "ssl" in raw.lower() or "certificate" in raw.lower():
         return "فشل التحقق من شهادة الاتصال الآمن.", status
-    return (raw[:320] if raw else "فشل غير محدد؛ راجع سجل Render."), status
+    return (raw[:320] if raw else "فشل غير محدد؛ راجع سجل خدمة الاستضافة."), status
 
 
 def test_one_api_route(route, model_id):
@@ -6865,10 +6869,10 @@ def api_project_runtime_start():
     user = current_user()
     if user["role"] != "user":
         return jsonify(error="هذه الأداة مخصصة لمساحة المستخدم."), 403
-    if os.environ.get("ALPHA_RUNTIME_BACKEND", "local").strip().lower() == "render":
+    if os.environ.get("ALPHA_RUNTIME_BACKEND", "local").strip().lower() == "railway":
         if request.form.get("confirm_remote_transfer") != "1":
             return jsonify(
-                error="يتطلب تشغيل المشروع موافقتك على نقل ملفاته إلى Render Sandboxes في منطقة Oregon.",
+                error="يتطلب تشغيل المشروع موافقتك على نقل ملفاته إلى خدمة Alpha Runner المنفصلة داخل شبكة Railway الخاصة بالمشروع.",
                 requires_remote_transfer_confirmation=True,
             ), 400
     uploads = request.files.getlist("files")

@@ -9,12 +9,12 @@ from urllib.parse import urlparse
 
 def main() -> int:
     if len(sys.argv) != 2:
-        print("Usage: python verify_alpha_deployment.py https://YOUR-SERVICE.onrender.com")
+        print("Usage: python verify_alpha_deployment.py https://YOUR-SERVICE.up.railway.app")
         return 2
     base = sys.argv[1].strip().rstrip("/")
     parsed = urlparse(base)
     if parsed.scheme != "https" or not parsed.netloc:
-        print("Use a valid HTTPS Render service URL.")
+        print("Use a valid HTTPS Railway service URL.")
         return 2
     try:
         import requests

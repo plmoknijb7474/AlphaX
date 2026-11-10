@@ -1,28 +1,31 @@
-# تحديث تفعيل Sandbox في Alpha — 9 نوفمبر 2026
+# تحديث بيئة التنفيذ — Railway Runner
 
-تم تغيير الإعداد الافتراضي في `render.yaml` إلى:
+تم استبدال الاعتماد السابق على Render Sandboxes بموصل داخلي لخدمة `alpha-runner` على Railway.
 
-```env
-ALPHA_RUNTIME_BACKEND=render
-ALPHA_SANDBOX_ENABLED=1
-RENDER_SANDBOX_PLAN=1c-2g
-```
+## البنية
 
-## ماذا يعني التفعيل؟
+- `alpha`: خدمة الويب وواجهة Alpha، ولا تنفذ كود المستخدم محلياً عندما يكون `ALPHA_RUNTIME_BACKEND=railway`.
+- `alpha-runner`: خدمة Railway خاصة، تستقبل طلبات موقعة برمز `ALPHA_RUNNER_TOKEN` عبر Private Networking.
+- يشغّل Runner مدير `RuntimeSandboxManager` الحالي، مع Linux user/mount/PID/network/IPC/UTS namespaces وchroot، ويُرفض التنفيذ إذا فشل فحص العزل.
 
-- اختبارات `pytest` المعتادة تعمل في بيئة التطوير/CI، ولا تحتاج إلى تشغيلها داخل Sandbox المستخدم.
-- عند بدء المستخدم جلسة Shell/Python من Project Intelligence، ينشئ Alpha بيئة Render Sandbox منفصلة ويشغّل الأوامر داخلها؛ لا ينفذ كود المستخدم داخل عملية Flask.
-- تفعيل العلم وحده لا ينشئ Sandbox ولا يثبت أن حساب Render متصل. يلزم إدخال `RENDER_API_KEY` و`RENDER_WORKSPACE_ID` في Render Dashboard، وترك `RENDER_SANDBOX_GROUP_ID` اختيارياً للمجموعة الافتراضية.
-- تحقق من `/api/project-runtime/status`: يجب أن تظهر `provider=render-sandboxes` و`enabled=true` و`missing=[]` و`ready=true`.
-- لا يُستخدم تنفيذ محلي بديل داخل Flask إذا فشل الاتصال.
+## متغيرات الواجهة
 
-## حدود وخصوصية
+- `ALPHA_RUNTIME_BACKEND=railway`
+- `ALPHA_SANDBOX_ENABLED=1`
+- `ALPHA_RUNNER_URL=http://alpha-runner.railway.internal:8080`
+- `ALPHA_RUNNER_TOKEN=<shared secret>`
 
-- الملفات التي يختارها المستخدم تنتقل إلى Render Sandboxes في Oregon بعد موافقته الظاهرة. لا ترفع أسراراً أو مفاتيح أو ملفات حساسة.
-- سياسة الخروج الشبكي `deny-all`. لا تُمرر `DATABASE_URL` أو مفاتيح Flask أو مفاتيح مزودي النماذج إلى Sandbox.
-- الخطة الافتراضية `1c-2g`، مع مهلة تشغيل ساعة وتعليق بعد 20 دقيقة من الخمول وفق إعداد التطبيق.
-- التفعيل لا ينشئ مورداً بذاته؛ بدء جلسة تنفيذ ينشئ Sandbox. تحاسب Render على موارد CPU والذاكرة أثناء النشاط، وعلى التخزين المؤقت للقطات وفق التسعير الحالي. راجع [Render Sandboxes](https://render.com/docs/sandboxes) و[التسعير](https://render.com/pricing).
+## متغيرات Runner
 
-## ما لم يتم التحقق منه هنا
+- `PORT=8080`
+- `ALPHA_SANDBOX_ENABLED=1`
+- `ALPHA_RUNNER_TOKEN=<same shared secret>`
+- Dockerfile: `Dockerfile.runner`
+- Healthcheck: `/internal/healthz`
+- نسخة واحدة وGunicorn worker واحد.
 
-تم تعديل ملفات المشروع فقط. لم تتوفر بيانات اعتماد Render في بيئة التعديل، لذلك لم يتم إنشاء Sandbox حية أو اختبار حساب المالك أو نشر Render.
+لا توجد حاجة إلى `RENDER_API_KEY` أو `RENDER_WORKSPACE_ID` أو `RAILWAY_API_TOKEN`. لا تمرر مفاتيح قاعدة البيانات أو مفاتيح النماذج إلى Runner.
+
+## شرط التفعيل الحقيقي
+
+`ALPHA_SANDBOX_ENABLED=1` يطلب التفعيل فقط. يجب أن يظهر `/api/project-runtime/status` بقيم `provider=railway-runner`, `enabled=true`, `ready=true`, `missing=[]`. قد تمنع بيئة Railway user namespaces أو mount/chroot؛ عندئذٍ تبقى الميزة غير جاهزة ويُرفض تنفيذ الكود (fail-closed). لم يتم إجراء اختبار حي على حساب Railway من بيئة إعداد هذه الحزمة.

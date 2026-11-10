@@ -23,6 +23,8 @@ import uuid
 import zipfile
 import stat
 import select
+import requests
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -829,431 +831,180 @@ class RuntimeSandboxManager:
 
 
 
-@dataclass
-class RenderRuntimeSession:
-    """A user-owned session backed by a managed Render Sandbox."""
-    session_id: str
-    user_id: str
-    sandbox_id: str
-    created_at: float
-    last_used: float
-    lock: threading.RLock = field(default_factory=threading.RLock)
-    logs: list[dict[str, Any]] = field(default_factory=list)
-    execution_count: int = 0
+class RailwayRuntimeSandboxManager:
+    """Remote runner adapter; user code runs only in the dedicated Railway runner service."""
 
-
-class RenderRuntimeSandboxManager:
-    """Managed Render Sandboxes adapter. Project code never runs in the Flask worker."""
-
-    REMOTE_ROOT = "/home/render/workspace"
-    COMMAND_TIMEOUT_SECONDS = 20
-    SANDBOX_RUNTIME_SECONDS = 3600
-    SANDBOX_IDLE_SECONDS = 1200
+    REQUEST_TIMEOUT = (4, 75)
 
     def __init__(self) -> None:
-        self._sessions: dict[str, RenderRuntimeSession] = {}
-        self._starting_users: set[str] = set()
-        self._lock = threading.RLock()
-        self._probe_lock = threading.Lock()
-        self._probe_checked_at = 0.0
-        self._probe_result: tuple[bool, str, int] = (False, "لم يتم الاتصال بخدمة Render Sandboxes بعد", 0)
-        self._client_instance = None
-        self._sweeper_stop = threading.Event()
-        self._sweeper = threading.Thread(
-            target=self._sweeper_loop, name="alpha-render-sandbox-sweeper", daemon=True
-        )
-        self._sweeper.start()
+        self._session = requests.Session()
 
     @staticmethod
     def _enabled() -> bool:
         return os.environ.get("ALPHA_SANDBOX_ENABLED", "0").strip() == "1"
 
     @staticmethod
-    def _configured() -> tuple[bool, list[str]]:
-        missing = []
-        if not os.environ.get("RENDER_API_KEY", "").strip():
-            missing.append("RENDER_API_KEY")
-        if not os.environ.get("RENDER_WORKSPACE_ID", "").strip():
-            missing.append("RENDER_WORKSPACE_ID")
-        try:
-            import render  # noqa: F401
-        except Exception:
-            missing.append("Render Python SDK (render>=1.8.0)")
-        return not missing, missing
+    def _configuration() -> tuple[str, str, list[str]]:
+        base_url = os.environ.get("ALPHA_RUNNER_URL", "").strip().rstrip("/")
+        token = os.environ.get("ALPHA_RUNNER_TOKEN", "").strip()
+        missing: list[str] = []
+        if not base_url:
+            missing.append("ALPHA_RUNNER_URL")
+        else:
+            try:
+                parsed = urlsplit(base_url)
+                host = (parsed.hostname or "").lower()
+                port = parsed.port
+            except ValueError:
+                parsed, host, port = None, "", None
+            local_allowed = os.environ.get("APP_ENV", "").lower() != "production" and host in {"localhost", "127.0.0.1"}
+            if parsed is None or parsed.scheme != "http" or not port or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                missing.append("ALPHA_RUNNER_URL (must be an internal HTTP URL with an explicit port)")
+            elif not (host.endswith(".railway.internal") or local_allowed):
+                missing.append("ALPHA_RUNNER_URL (must use Railway private networking)")
+        if not token:
+            missing.append("ALPHA_RUNNER_TOKEN")
+        elif len(token) < 32:
+            missing.append("ALPHA_RUNNER_TOKEN (must be at least 32 characters)")
+        return base_url, token, missing
 
-    def _make_client(self):
-        if self._client_instance is not None:
-            return self._client_instance
+    def _request(self, method: str, path: str, *, timeout=None, **kwargs):
+        base_url, token, missing = self._configuration()
+        if missing:
+            raise RuntimeSandboxError("إعداد خدمة Railway Runner ناقص: " + ", ".join(missing))
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers["Authorization"] = "Bearer " + token
+        headers["Accept"] = "application/json"
         try:
-            from render import Render
-            token = os.environ.get("RENDER_API_KEY", "").strip()
-            owner_id = os.environ.get("RENDER_WORKSPACE_ID", "").strip()
-            self._client_instance = Render(token=token, owner_id=owner_id)
-            return self._client_instance
-        except Exception as exc:
-            raise RuntimeSandboxError(
-                "تعذر تحميل عميل Render Sandboxes. تحقق من تثبيت render>=1.8.0 وإعداد مفاتيح الخدمة."
-            ) from exc
-
-    def _probe_provider(self, force: bool = False) -> tuple[bool, str, int]:
-        now = time.monotonic()
-        with self._probe_lock:
-            if not force and now - self._probe_checked_at < 60:
-                return self._probe_result
-            configured, missing = self._configured()
-            if not configured:
-                result = (False, "إعداد Render Sandboxes ناقص: " + ", ".join(missing), 0)
-            else:
-                try:
-                    client = self._make_client()
-                    groups = client.sandboxes.list_groups(limit=100)
-                    group_items = getattr(groups, "groups", None)
-                    if group_items is None and isinstance(groups, dict):
-                        group_items = groups.get("groups", [])
-                    group_items = group_items or []
-                    configured_group = os.environ.get("RENDER_SANDBOX_GROUP_ID", "").strip()
-                    if configured_group and not any(str(getattr(x, "id", x.get("id") if isinstance(x, dict) else "")) == configured_group for x in group_items):
-                        result = (False, "معرّف RENDER_SANDBOX_GROUP_ID غير موجود ضمن مجموعات مساحة العمل.", len(group_items))
-                    elif not group_items and not configured_group:
-                        # Render creates the workspace's first default group automatically
-                        # when the first sandbox is created. Do not create resources in GET status.
-                        result = (True, "تم التحقق من Render API. لا توجد Sandbox Group بعد؛ سيُنشئ Render المجموعة الافتراضية عند أول إنشاء Sandbox.", 0)
-                    else:
-                        result = (True, "تم الاتصال بواجهة Render Sandboxes والتحقق من مجموعة التنفيذ. لم يتم إنشاء Sandbox في فحص الحالة.", len(group_items))
-                except Exception as exc:
-                    # SDK errors may contain request details; never return them to the browser.
-                    result = (False, "تعذر الاتصال بواجهة Render Sandboxes (" + type(exc).__name__ + ").", 0)
-            self._probe_result = result
-            self._probe_checked_at = time.monotonic()
-            return result
+            response = self._session.request(
+                method, base_url + path, headers=headers,
+                timeout=timeout or self.REQUEST_TIMEOUT,
+                allow_redirects=False, **kwargs,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeSandboxError("تعذر الاتصال بخدمة Alpha Runner عبر شبكة Railway الخاصة (" + type(exc).__name__ + ").") from exc
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("error")
+            except (ValueError, AttributeError):
+                detail = None
+            raise RuntimeSandboxError(str(detail or "فشلت خدمة Alpha Runner بطلب HTTP " + str(response.status_code))[:500])
+        return response
 
     def capability_status(self) -> dict[str, Any]:
         enabled = self._enabled()
-        configured, missing = self._configured()
-        connected, detail, group_count = self._probe_provider() if configured and enabled else (False, "", 0)
-        if not configured:
-            note = "خدمة Render Sandboxes غير مكتملة الإعداد. أضف SDK ومفتاح API ومعرّف مساحة العمل في متغيرات Render."
-        elif not enabled:
-            note = "موصل Render Sandboxes جاهز للإعداد لكنه متوقف افتراضياً. راجع نقل ملفات المشاريع إلى منطقة Oregon قبل تفعيل التنفيذ."
-        elif connected:
-            note = "اتصال Render Sandboxes ناجح. سيتم تنفيذ المشروع داخل Sandbox مستقل بسياسة شبكة deny-all."
-        else:
-            note = detail or "تعذر التحقق من خدمة Render Sandboxes."
-        return {
-            "provider": "render-sandboxes",
+        base_url, _token, missing = self._configuration()
+        base = {
+            "provider": "railway-runner",
             "enabled": enabled,
-            "available": configured and connected,
-            "ready": enabled and configured and connected,
+            "available": False,
+            "ready": False,
             "missing": missing,
-            "sandbox_group_count": group_count,
-            "region": "oregon",
-            "network_policy": "deny-all",
-            "isolation": "Managed Render Sandbox; project files are transferred to a separate ephemeral sandbox. No outbound network access.",
+            "isolation": "Dedicated Railway runner service; Linux user, mount, PID, network and IPC namespaces plus chroot; fail-closed when kernel isolation is unavailable.",
             "package_policy": "Offline wheel files only under wheels/ or wheelhouse/.",
-            "note": note,
-            "probe_detail": detail if enabled and not connected else "",
-            "beta": True,
-            "data_region_notice": "تُرسل ملفات المشروع إلى بيئة Render Sandboxes في Oregon؛ لا ترفع ملفات حساسة قبل قبول هذا النقل.",
+            "data_region_notice": "ستُنقل ملفات المشروع إلى خدمة التنفيذ المنفصلة داخل شبكة Railway الخاصة بالمشروع. لا ترفق أسراراً أو ملفات حساسة.",
+            "note": "",
         }
-
-    def _sweeper_loop(self) -> None:
-        while not self._sweeper_stop.wait(30):
-            try:
-                self._cleanup_expired()
-            except Exception:
-                continue
-
-    def _terminate_remote(self, sandbox_id: str) -> None:
+        if not enabled:
+            base["note"] = "تنفيذ المشاريع متوقف. فعّل ALPHA_SANDBOX_ENABLED=1 في خدمتي AlphaX وAlpha Runner."
+            return base
+        if missing:
+            base["note"] = "إعداد خدمة Railway Runner ناقص: " + ", ".join(missing)
+            return base
         try:
-            self._make_client().sandboxes.terminate(sandbox_id)
-        except Exception:
-            # Remote TTL also guarantees eventual cleanup if the API is temporarily unavailable.
-            pass
-
-    def _stop_locked(self, sid: str) -> None:
-        item = self._sessions.pop(sid, None)
-        if item:
-            with item.lock:
-                self._terminate_remote(item.sandbox_id)
-
-    def _cleanup_expired(self) -> None:
-        now = time.time()
-        with self._lock:
-            expired = [
-                sid for sid, item in self._sessions.items()
-                if now - item.last_used > SESSION_TTL_SECONDS
-                or now - item.created_at > MAX_SESSION_LIFETIME_SECONDS
-            ]
-            for sid in expired:
-                self._stop_locked(sid)
+            remote = self._request("GET", "/internal/runtime/status", timeout=(3, 12)).json()
+            ready = bool(remote.get("ready"))
+            base.update({
+                "available": bool(remote.get("available")),
+                "ready": ready,
+                "missing": list(remote.get("missing") or []),
+                "note": str(remote.get("note") or ("خدمة Railway Runner جاهزة." if ready else "خدمة Railway Runner متصلة لكن اختبار العزل لم ينجح.")),
+                "runner": remote.get("runner", "alpha-runner"),
+            })
+            if remote.get("probe_detail"):
+                base["probe_detail"] = str(remote["probe_detail"])[:300]
+        except (RuntimeSandboxError, ValueError) as exc:
+            base["note"] = str(exc)[:500]
+            base["missing"] = ["runner connection or status probe"]
+        return base
 
     def start(self, user_id: str | int, uploads: list[Any]) -> dict[str, Any]:
-        self._cleanup_expired()
-        status = self.capability_status()
-        if not status["ready"]:
-            raise RuntimeSandboxError(status["note"])
-        uid = str(user_id)
-        with self._lock:
-            if uid in self._starting_users:
-                raise RuntimeSandboxError("يتم تجهيز مساحة تنفيذ أخرى لهذا الحساب بالفعل.")
-            owned = [sid for sid, item in self._sessions.items() if item.user_id == uid]
-            for sid in owned:
-                self._stop_locked(sid)
-            if len(self._sessions) + len(self._starting_users) >= MAX_SESSIONS:
-                raise RuntimeSandboxError("بيئة التنفيذ مشغولة حالياً. أغلق جلسة أخرى أو أعد المحاولة لاحقاً.")
-            self._starting_users.add(uid)
-
-        holder = None
-        sandbox = None
+        files = []
         try:
-            holder = tempfile.TemporaryDirectory(prefix="alpha-render-upload-")
-            input_dir = Path(holder.name) / "workspace"
-            input_dir.mkdir(mode=0o700)
-            count, total = _build_input_from_uploads(uploads, input_dir)
-            client = self._make_client()
-            create_kwargs = {
-                "plan": os.environ.get("RENDER_SANDBOX_PLAN", "1c-2g").strip(),
-                "timeout_seconds": self.SANDBOX_RUNTIME_SECONDS,
-                "idle_timeout_seconds": self.SANDBOX_IDLE_SECONDS,
-                "network_policy": "deny-all",
-                "wait": True,
-            }
-            if os.environ.get("RENDER_SANDBOX_GROUP_ID", "").strip():
-                create_kwargs["sandbox_group_id"] = os.environ["RENDER_SANDBOX_GROUP_ID"].strip()
-            sandbox = client.sandboxes.create(**create_kwargs)
-            mkdir_exit = None
-            for event in client.sandboxes.exec(sandbox.id, "mkdir -p " + shlex.quote(self.REMOTE_ROOT)):
-                if isinstance(event, dict) and "exit_code" in event:
-                    mkdir_exit = int(event["exit_code"])
-                elif hasattr(event, "exit_code"):
-                    mkdir_exit = int(event.exit_code)
-            if mkdir_exit != 0:
-                raise RuntimeSandboxError("تعذر تجهيز مجلد المشروع داخل Render Sandbox.")
-            client.sandboxes.copy_to(sandbox.id, str(input_dir), self.REMOTE_ROOT)
-            sid = str(uuid.uuid4())
-            item = RenderRuntimeSession(sid, uid, sandbox.id, time.time(), time.time())
-            with self._lock:
-                self._sessions[sid] = item
-            return {
-                "session_id": sid, "file_count": count, "size_bytes": total,
-                "expires_in_seconds": SESSION_TTL_SECONDS,
-                "provider": "render-sandboxes", "region": "oregon",
-            }
-        except RuntimeSandboxError:
-            if sandbox is not None:
-                self._terminate_remote(sandbox.id)
-            raise
-        except Exception as exc:
-            if sandbox is not None:
-                self._terminate_remote(sandbox.id)
-            raise RuntimeSandboxError(
-                "تعذر تجهيز Sandbox على Render (" + type(exc).__name__ + "). تحقق من صلاحيات الحساب ومجموعة Sandbox والحدود المتاحة."
-            ) from exc
+            for upload in uploads:
+                stream = getattr(upload, "stream", upload)
+                try:
+                    stream.seek(0)
+                except (AttributeError, OSError):
+                    pass
+                filename = str(getattr(upload, "filename", "") or "upload.bin")
+                content_type = str(getattr(upload, "mimetype", "application/octet-stream") or "application/octet-stream")
+                files.append(("files", (filename, stream, content_type)))
+            response = self._request(
+                "POST", "/internal/runtime/start", data={"user_id": str(user_id)},
+                files=files, timeout=(5, 100),
+            )
+            payload = response.json()
         finally:
-            if holder is not None:
-                holder.cleanup()
-            with self._lock:
-                self._starting_users.discard(uid)
-
-    def _get_owned(self, user_id: str | int, session_id: str) -> RenderRuntimeSession:
-        try:
-            sid = str(uuid.UUID(str(session_id)))
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise RuntimeSandboxError("معرّف جلسة التنفيذ غير صالح.") from exc
-        with self._lock:
-            item = self._sessions.get(sid)
-            if item is None or item.user_id != str(user_id):
-                raise RuntimeSandboxError("جلسة التنفيذ غير موجودة أو انتهت. ابدأ جلسة جديدة وأرفق المشروع مجدداً.")
-            now = time.time()
-            if now - item.last_used > SESSION_TTL_SECONDS or now - item.created_at > MAX_SESSION_LIFETIME_SECONDS:
-                self._stop_locked(sid)
-                raise RuntimeSandboxError("انتهت مدة جلسة التنفيذ. ابدأ جلسة جديدة وأرفق المشروع مجدداً.")
-            item.last_used = now
-            return item
-
-    def _run_remote(self, item: RenderRuntimeSession, shell_command: str) -> dict[str, Any]:
-        client = self._make_client()
-        wrapped = (
-            "cd " + shlex.quote(self.REMOTE_ROOT) + " && "
-            "timeout --signal=TERM --kill-after=2s " + str(self.COMMAND_TIMEOUT_SECONDS) + "s "
-            "bash -c " + shlex.quote(shell_command)
-        )
-        started = time.monotonic()
-        stdout_parts: list[str] = []
-        stderr_parts: list[str] = []
-        total_chars = 0
-        exit_code = None
-        try:
-            for event in client.sandboxes.exec(item.sandbox_id, wrapped):
-                if isinstance(event, dict) and "exit_code" in event:
-                    exit_code = int(event["exit_code"])
-                    continue
-                if hasattr(event, "exit_code"):
-                    exit_code = int(event.exit_code)
-                    continue
-                if isinstance(event, dict):
-                    stream = event.get("stream")
-                    data = event.get("data", "")
-                else:
-                    stream = getattr(event, "stream", None)
-                    data = getattr(event, "data", "")
-                chunk = str(data or "")
-                total_chars += len(chunk)
-                if total_chars > MAX_OUTPUT_CHARS:
-                    self._stop_locked(item.session_id)
-                    raise RuntimeSandboxError("تجاوز خرج الأمر الحد الآمن؛ تم إنهاء Sandbox لحماية الخدمة.")
-                (stderr_parts if stream == "stderr" else stdout_parts).append(chunk)
-            if exit_code is None:
-                raise RuntimeSandboxError("انقطع تدفق نتائج الأمر قبل استلام رمز الخروج.")
-        except RuntimeSandboxError:
-            raise
-        except Exception as exc:
-            raise RuntimeSandboxError("تعذر تنفيذ الأمر داخل Render Sandbox (" + type(exc).__name__ + ").") from exc
-        duration = int((time.monotonic() - started) * 1000)
-        return {
-            "exit_code": exit_code,
-            "stdout": "".join(stdout_parts),
-            "stderr": "".join(stderr_parts),
-            "duration_ms": duration,
-            "timed_out": exit_code == 124 or exit_code == 137,
-            "created_at": _utc_now(),
-        }
+            files.clear()
+        payload.pop("ok", None)
+        return payload
 
     def execute(
         self, user_id: str | int, session_id: str, action: str, *,
         command: str = "", path: str = "", packages: list[str] | None = None,
     ) -> dict[str, Any]:
-        item = self._get_owned(user_id, session_id)
-        if action not in {"shell", "python", "venv", "install"}:
-            raise RuntimeSandboxError("نوع العملية غير مدعوم.")
-        if action == "shell":
-            if not isinstance(command, str) or not command.strip() or len(command) > MAX_COMMAND_CHARS:
-                raise RuntimeSandboxError("اكتب أمراً من 1 إلى 6000 حرف.")
-            shell_command, label = command, command[:300]
-        elif action == "python":
-            safe = _safe_relative_path(path)
-            if not safe or not safe.lower().endswith(".py"):
-                raise RuntimeSandboxError("حدد مسار ملف Python نسبيّاً مثل main.py.")
-            shell_command = "test -f " + shlex.quote(safe) + " && python3 -B " + shlex.quote(safe)
-            label = "Python: " + safe
-        elif action == "venv":
-            shell_command = "python3 -m venv .venv"
-            label = "Create virtual environment: .venv"
-        else:
-            if not isinstance(packages, list) or not 1 <= len(packages) <= 10 or any(
-                not isinstance(x, str) or not PACKAGE_SPEC_RE.fullmatch(x) for x in packages
-            ):
-                raise RuntimeSandboxError("أدخل من 1 إلى 10 أسماء حزم بصيغة package أو package==version فقط.")
-            shell_command = (
-                "test -d .venv || { echo 'Create .venv first'; exit 2; }; "
-                "find wheels wheelhouse -maxdepth 1 -type f -name '*.whl' -print -quit 2>/dev/null | grep -q . "
-                "|| { echo 'No local wheel files found in wheels/ or wheelhouse/'; exit 2; }; "
-                "./.venv/bin/python -m pip install --no-index --no-cache-dir --disable-pip-version-check "
-                "--find-links=./wheels --find-links=./wheelhouse " + shlex.join(packages)
-            )
-            label = "Install offline packages: " + ", ".join(packages)
-
-        with item.lock:
-            if item.execution_count >= MAX_EXECUTIONS_PER_SESSION:
-                raise RuntimeSandboxError("تم بلوغ الحد الأقصى لعدد العمليات في الجلسة. أوقفها وابدأ جلسة جديدة.")
-            result = self._run_remote(item, shell_command)
-            item.execution_count += 1
-            safe_result = {
-                "ok": result["exit_code"] == 0 and not result["timed_out"],
-                "action": action, "command": label, "exit_code": result["exit_code"],
-                "stdout": result["stdout"][:MAX_OUTPUT_CHARS],
-                "stderr": result["stderr"][:MAX_OUTPUT_CHARS],
-                "timed_out": result["timed_out"], "duration_ms": result["duration_ms"],
-                "created_at": result["created_at"],
-            }
-            item.logs.append(safe_result)
-            item.logs[:] = item.logs[-40:]
-            item.last_used = time.time()
-        return {
-            "result": safe_result, "logs": item.logs[-20:], "session_id": item.session_id,
-            "expires_in_seconds": SESSION_TTL_SECONDS,
-        }
+        payload = self._request(
+            "POST", "/internal/runtime/execute",
+            json={"user_id": str(user_id), "session_id": session_id, "action": action,
+                  "command": command, "path": path, "packages": packages or []},
+        ).json()
+        payload.pop("ok", None)
+        return payload
 
     def export(self, user_id: str | int, session_id: str) -> bytes:
-        item = self._get_owned(user_id, session_id)
-        client = self._make_client()
-        with tempfile.TemporaryDirectory(prefix="alpha-render-export-") as temp:
-            destination = Path(temp) / "workspace"
-            destination.mkdir()
-            try:
-                client.sandboxes.copy_from(item.sandbox_id, self.REMOTE_ROOT, str(destination))
-            except Exception as exc:
-                raise RuntimeSandboxError("تعذر تنزيل ملفات المشروع من Render Sandbox (" + type(exc).__name__ + ").") from exc
-            buffer = __import__("io").BytesIO()
-            count = total = 0
-            with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as archive:
-                for base, dirs, files in os.walk(destination, followlinks=False):
-                    dirs[:] = sorted(
-                        d for d in dirs
-                        if d.lower() not in SKIP_DIRS | SECRET_DIRS
-                        and not os.path.islink(os.path.join(base, d))
-                    )
-                    for filename in sorted(files):
-                        absolute = Path(base) / filename
-                        if absolute.is_symlink() or not absolute.is_file():
-                            continue
-                        relative = absolute.relative_to(destination).as_posix()
-                        safe = _safe_relative_path(relative)
-                        if not safe:
-                            continue
-                        size = absolute.stat().st_size
-                        if size > MAX_SINGLE_FILE:
-                            continue
-                        total += size
-                        count += 1
-                        if count > MAX_ARCHIVE_FILES or total > MAX_UNPACKED_BYTES:
-                            raise RuntimeSandboxError("حجم المشروع المُصدّر تجاوز الحدود الآمنة.")
-                        archive.write(absolute, safe)
-            raw = buffer.getvalue()
-            if len(raw) > MAX_EXPORT_BYTES:
-                raise RuntimeSandboxError("نسخة المشروع أكبر من الحد المسموح للتنزيل.")
-            item.last_used = time.time()
-            return raw
+        response = self._request(
+            "GET", "/internal/runtime/export",
+            params={"user_id": str(user_id), "session_id": session_id},
+            timeout=(5, 35),
+        )
+        raw = response.content
+        if len(raw) > MAX_EXPORT_BYTES:
+            raise RuntimeSandboxError("نسخة المشروع أكبر من الحد المسموح للتنزيل.")
+        if not raw.startswith(b"PK\x03\x04"):
+            raise RuntimeSandboxError("استجابة التصدير من خدمة Railway Runner ليست ZIP صالحاً.")
+        return raw
 
     def stop(self, user_id: str | int, session_id: str) -> bool:
-        item = self._get_owned(user_id, session_id)
-        with self._lock:
-            self._stop_locked(item.session_id)
-        return True
+        payload = self._request(
+            "POST", "/internal/runtime/stop",
+            json={"user_id": str(user_id), "session_id": session_id},
+        ).json()
+        return bool(payload.get("ok"))
 
     def status_for(self, user_id: str | int, session_id: str) -> dict[str, Any]:
-        item = self._get_owned(user_id, session_id)
-        remote_status = "unknown"
-        try:
-            remote = self._make_client().sandboxes.from_id(item.sandbox_id)
-            remote_status = str(getattr(remote, "status", "unknown"))
-            if remote_status in {"terminated", "errored"}:
-                with self._lock:
-                    self._sessions.pop(item.session_id, None)
-                return {"active": False, "session_id": item.session_id, "logs": item.logs[-20:], "remote_status": remote_status}
-        except Exception:
-            remote_status = "unavailable"
-        return {
-            "active": True, "session_id": item.session_id, "logs": item.logs[-20:],
-            "expires_in_seconds": max(0, SESSION_TTL_SECONDS - int(time.time() - item.last_used)),
-            "remote_status": remote_status,
-        }
+        return self._request(
+            "GET", "/internal/runtime/session",
+            params={"user_id": str(user_id), "session_id": session_id},
+            timeout=(3, 12),
+        ).json()
 
     def shutdown_all(self) -> None:
-        self._sweeper_stop.set()
-        with self._lock:
-            for sid in list(self._sessions):
-                self._stop_locked(sid)
+        # Sessions belong to the dedicated runner service; web restarts must not terminate them.
+        return None
 
 
 class RuntimeSandboxRouter:
-    """Select the local namespace backend or managed Render backend by deployment config."""
+    """Select a local namespace backend or the dedicated Railway runner service."""
 
     def __init__(self) -> None:
-        if os.environ.get("ALPHA_RUNTIME_BACKEND", "local").strip().lower() == "render":
-            self._backend = RenderRuntimeSandboxManager()
-        else:
+        selected = os.environ.get("ALPHA_RUNTIME_BACKEND", "local").strip().lower()
+        if selected == "railway":
+            self._backend = RailwayRuntimeSandboxManager()
+        elif selected == "local":
             self._backend = RuntimeSandboxManager()
+        else:
+            raise RuntimeError("ALPHA_RUNTIME_BACKEND must be either 'local' or 'railway'.")
 
     def capability_status(self):
         return self._backend.capability_status()
@@ -1275,6 +1026,5 @@ class RuntimeSandboxRouter:
 
     def shutdown_all(self):
         self._backend.shutdown_all()
-
 
 runtime_sandbox = RuntimeSandboxRouter()
