@@ -1,0 +1,58 @@
+تقرير تجهيز التكامل الحي لـ Alpha — 8 نوفمبر 2026
+================================================
+
+الخلاصة
+-------
+جهّزت موصل Render Sandboxes الرسمي، وأدوات فحص Supabase وHTTP، ودليل التشغيل الحي. لا يوجد اتصال فعلي بحساب Render أو قاعدة Supabase في جلسة التدقيق الحالية؛ لذلك لم أفعّل ALPHA_SANDBOX_ENABLED ولم أدّع نجاح نشر حي.
+
+ما تم تغييره
+------------
+1. إضافة RenderRuntimeSandboxManager إلى runtime_sandbox.py باستخدام SDK الرسمي render>=1.8.0.
+2. جعل مزود الإنتاج في render.yaml هو Render Sandboxes، مع إبقاء ALPHA_SANDBOX_ENABLED=0 حتى ينجح الاختبار الحي.
+3. فرض network_policy=deny-all عند إنشاء Sandbox، وعدم تمرير DATABASE_URL أو FLASK_SECRET_KEY أو API_ENCRYPTION_KEY أو مفاتيح مزودي النماذج إلى بيئة التنفيذ.
+4. إضافة موافقة صريحة في التطبيق قبل نقل ملفات المشروع إلى Sandbox منفصلة في Oregon.
+5. إضافة اكتشاف مجموعة Sandbox؛ وإن لم توجد مجموعة ولم يحدد المستخدم واحدة، يسمح الموصل بمجموعة Render الافتراضية التي تنشأ عند أول Sandbox بدلاً من إظهار تعذر كاذب.
+6. فحص حدّ صلاحيات المستخدم، ملكية الجلسة، مهلات التنفيذ، رفع الملفات وتنزيلها، وإنهاء Sandbox.
+7. إضافة render_sandbox_probe.py: اختبار حي مؤقت للأوامر المحددة بالوقت، وPython وvenv وpip، ونقل الملفات بالاتجاهين، ومنع الشبكة، ثم إنهاء Sandbox. فشل التنظيف يجعل نتيجة السكربت فاشلة.
+8. إضافة supabase_live_check.py: فحص قراءة فقط عبر SELECT 1 والتحقق من وجود جداول users وchat_messages وchat_workspace_files وproject_checkpoints وalpha_project_memory. لا يطبع DSN ولا يقرأ محتوى المستخدمين.
+9. إضافة verify_alpha_deployment.py لفحص HTTPS /healthz والتأكد من HTTP 200 وحالة ok.
+10. تحديث دليل النشر لاستخدام Supabase Shared Pooler Transaction mode على المنفذ 6543 مع تعطيل prepared statements في psycopg، وهو متوافق مع اتصالات الطلبات القصيرة في خدمة Flask الحالية.
+11. تحديث دليل Termux لتضمين الملفات الجديدة وقائمة git add الصريحة دون git add -A.
+
+التحقق المحلي
+--------------
+- pytest -q: 123 passed, 25 subtests passed.
+- compileall لجميع ملفات Python في المشروع (باستثناء البيئات المولّدة): PASS.
+- فحص صياغة JavaScript المضمّن في AlphaX.html باستخدام node --check بعد استبدال حقول Jinja الاختبارية: PASS.
+- مقارنة الحزمة الجديدة مع Alpha-Final-Audit-Updated.zip: كل الملفات الـ51 الأصلية محفوظة.
+- الحزمة النهائية: 59 ملفاً (51 أصلياً + 7 ملفات تكامل/اختبار جديدة + هذا التقرير).
+- لم تظهر أسماء ملفات أسرار أو قواعد بيانات محلية ضمن الملفات التي ستدخل ZIP. استُثنيت .venv و.pytest_cache و__pycache__ وملف المساعد الداخلي add_render_backend.py.
+
+ما تم تشغيله فعلياً في بيئة التدقيق
+----------------------------------
+- python supabase_live_check.py: توقف كما هو متوقع عند مرحلة الإعداد برسالة DATABASE_URL is not set (exit 2). لم يتم فتح اتصال بقاعدة بيانات.
+- python render_sandbox_probe.py: توقف كما هو متوقع لغياب RENDER_API_KEY وRENDER_WORKSPACE_ID (exit 2). لم ينشئ أي Sandbox ولم يستهلك موارد Render.
+- الحزم Flask وGunicorn وpsycopg وrender غير مثبتة في بيئة التدقيق الحالية؛ لذا لم أشغّل خادم Flask/Gunicorn ولم أرسل طلب HTTP إلى نسخة منشورة.
+- مسار /healthz موجود في app.py ومحدد في render.yaml، لكن لم يتم اختباره بخادم حي.
+
+ما بقي على حساب المالك
+----------------------
+1. رفع الحزمة إلى GitHub ونشرها إلى خدمة Render الحالية.
+2. إضافة DATABASE_URL من Supabase Shared Pooler Transaction mode port 6543 مع الحفاظ على مفاتيح التشفير والجلسات القديمة.
+3. تشغيل python supabase_live_check.py داخل Render Shell أو من جهاز موثوق بعد إدخال DSN في متغير بيئة مخفي؛ النجاح يتطلب SELECT 1 وكل الجداول الخمسة.
+4. إضافة RENDER_API_KEY وRENDER_WORKSPACE_ID، وRENDER_SANDBOX_GROUP_ID اختيارياً.
+5. تشغيل python render_sandbox_probe.py؛ يجب أن تكون النتائج الأربع PASS وكذلك sandbox_cleanup: PASS.
+6. فحص https://YOUR-SERVICE.onrender.com/healthz عبر python verify_alpha_deployment.py.
+7. فقط بعد نجاح الاختبارات الحية، تغيير ALPHA_SANDBOX_ENABLED إلى 1. لا تشغّل كود المستخدم داخل خدمة Flask نفسها.
+
+الخصوصية والتكلفة والقيود
+-------------------------
+- Render Sandboxes خدمة Public Beta وقد تتغير خصائصها.
+- مزود Sandbox الحالي يعمل في Oregon؛ نقل المشروع إلى هناك يحدث بعد موافقة المستخدم في الواجهة.
+- سياسة الشبكة deny-all، ولا تنتقل أسرار Flask أو مفاتيح النماذج أو بيانات اتصال قاعدة البيانات إلى Sandbox.
+- لا تدعم Render Sandboxes حالياً الاتصال الخاص بخدمات Render أو قواعد البيانات؛ تطبيق Flask وحده يتصل بـSupabase.
+- الاختبار الحي ينشئ Sandbox مؤقتة وقد يتسبب في تكلفة استخدام. السكربت يحاول إنهاءها دائماً؛ عند فشل التنظيف يجب مراجعة Render Dashboard يدوياً.
+- لا ترسل مفاتيح Render أو Supabase أو DATABASE_URL إلى المحادثة، ولا ترفعها إلى GitHub.
+
+تحديث إعداد النشر — 9 نوفمبر 2026
+بناءً على طلب المستخدم، تم تغيير `render.yaml` في الحزمة الحالية إلى `ALPHA_SANDBOX_ENABLED=1` افتراضياً لمزود `ALPHA_RUNTIME_BACKEND=render`. هذا التحديث يحل محل توصية الإيقاف الافتراضي الواردة في هذا التقرير التاريخي. لا يعني تغيير العلم أن اتصال Render الحي قد تم اختباره؛ يلزم ضبط `RENDER_API_KEY` و`RENDER_WORKSPACE_ID` والتحقق من حالة `/api/project-runtime/status`. لم يتم تشغيل Sandbox حية من جلسة تعديل الملفات هذه.
